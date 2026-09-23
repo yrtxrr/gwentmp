@@ -3196,3 +3196,28 @@ function startLoadingEffect() {
 function stopLoadingEffect() {
 	passButton.classList.remove('loading');
 }
+
+// Keep the 16:9 board fully visible on short landscape mobile viewports.
+function updateSafariBoardScale() {
+	const board = document.querySelector("main");
+	const customization = document.getElementById("deck-customization");
+	if (!board) return;
+
+	const width = window.innerWidth;
+	const height = window.innerHeight;
+	const boardHeight = width * 1080 / 1920;
+	const scale = Math.min(1, height / boardHeight);
+	const left = Math.max(0, (width - width * scale) / 2);
+
+	document.documentElement.style.setProperty("--gwent-scale", String(scale));
+	document.documentElement.style.setProperty("--gwent-left", left + "px");
+
+	if (customization) {
+		customization.style.setProperty("--gwent-scale", String(scale));
+		customization.style.setProperty("--gwent-left", left + "px");
+	}
+}
+
+window.addEventListener("resize", updateSafariBoardScale, { passive: true });
+window.addEventListener("orientationchange", () => setTimeout(updateSafariBoardScale, 100), { passive: true });
+updateSafariBoardScale();

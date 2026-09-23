@@ -154,11 +154,11 @@ async function botTakeTurn(bot) {
 	if (!localBotMode || bot !== player_op || bot.passed)
 		return;
 
+	// The bot evaluates the board before every move instead of simply
+	// throwing its highest-power card onto its native row.
 	const hand = bot.hand.cards.slice();
 	const playable = hand.filter(card => {
 		if (card.name === "Decoy" || card.abilities.includes("medic"))
-			return false;
-		if (card.name === "Clear Weather" && weather.cards.length === 0)
 			return false;
 		return true;
 	});
@@ -168,13 +168,53 @@ async function botTakeTurn(bot) {
 		return;
 	}
 
-	const scored = playable.map(card => ({ card, score: botCardScore(card, bot) }));
-	scored.sort((a, b) => b.score - a.score);
-	const card = scored[0].card;
+	// Passing is an important part of classic Gwent. Don't spend cards
+	// unnecessarily when we're already comfortably ahead.
+	const lead = bot.total - player_me.total;
+	if (lead >= 7 && hand.length <= player_me.hand.cards.length + 1) {
+		bot.passRound();
+		return;
+	}
+
+	// Use a leader ability when it has a clear, safe payoff. Some original
+	// leaders require a human selection UI, so those are intentionally left
+	// for later rather than risking a stuck bot turn.
+	if (bot.leaderAvailable && botLeaderIsSafe(bot)) {
+		const leaderValue = botLeaderScore(bot);
+		if (leaderValue >= 18 || (lead < -10 && leaderValue >= 10)) {
+			try {
+				await bot.activateLeader();
+				return;
+			} catch (err) {
+				console.error("Bot leader failed:", err);
+			}
+		}
+	}
+
+	const scored = playable.map(card => ({
+		card,
+		score: botCardScore(card, bot)
+	})).sort((a, b) => b.score - a.score);
+
+	const best = scored[0];
+	if (!best || best.score < -25) {
+		bot.passRound();
+		return;
+	}
 
 	try {
+		const card = best.card;
+
 		if (card.name === "Scorch") {
-			await bot.playScorch(card);
+			if (botShouldScorch(bot))
+				await bot.playScorch(card);
+			else
+				await botPlayBestFallback(bot, playable);
+			return;
+		}
+
+		if (card.name === "Clear Weather") {
+			await bot.playCard(card);
 			return;
 		}
 
@@ -183,24 +223,21 @@ async function botTakeTurn(bot) {
 			return;
 		}
 
-		if (card.isUnit()) {
-			const rowName = botBestRow(card);
-			await bot.playCardToRow(card, board.getRow(card, rowName, bot));
+		if (card.isSpecial()) {
+			const rowName = botBestSpecialRow(card, bot);
+			if (rowName)
+				await bot.playCardToRow(card, board.getRow(card, rowName, bot));
+			else
+				await botPlayBestFallback(bot, playable);
 			return;
 		}
 
-		// Special cards that require a human target are deliberately held for now.
-		const fallback = playable.find(c => c.isUnit() || c.faction === "weather" || c.name === "Scorch");
-		if (fallback) {
-			if (fallback.name === "Scorch")
-				await bot.playScorch(fallback);
-			else if (fallback.faction === "weather")
-				await bot.playCard(fallback);
-			else
-				await bot.playCardToRow(fallback, board.getRow(fallback, botBestRow(fallback), bot));
-		} else {
-			bot.passRound();
+		if (card.isUnit()) {
+			await bot.playCardToRow(card, board.getRow(card, botBestRow(card, bot), bot));
+			return;
 		}
+
+		await botPlayBestFallback(bot, playable);
 	} catch (err) {
 		console.error("Bot turn failed:", err);
 		if (!bot.passed)
@@ -208,41 +245,213 @@ async function botTakeTurn(bot) {
 	}
 }
 
+async function botPlayBestFallback(bot, cards) {
+	const units = cards.filter(c => c.isUnit()).sort((a, b) => botCardScore(b, bot) - botCardScore(a, bot));
+	if (units.length) {
+		const card = units[0];
+		await bot.playCardToRow(card, board.getRow(card, botBestRow(card, bot), bot));
+		return;
+	}
+	const weatherCard = cards.find(c => c.faction === "weather");
+	if (weatherCard) {
+		await bot.playCard(weatherCard);
+		return;
+	}
+	bot.passRound();
+}
+
 function botCardScore(card, bot) {
 	let score = card.basePower || 0;
+	const enemy = bot.opponent();
 
-	if (card.abilities.includes("spy"))
-		score += 18;
-	if (card.abilities.includes("muster"))
-		score += 8;
+	if (card.hero)
+		score += 5;
+
+	if (card.abilities.includes("spy")) {
+		// Spy gives two cards: usually worth more than its printed strength.
+		score += 16 + Math.max(0, 10 - bot.hand.cards.length);
+	}
+
+	if (card.abilities.includes("muster")) {
+		const same = bot.deck.cards.concat(bot.hand.cards).filter(c =>
+			c.name === card.name || c.name.startsWith(card.name.split("-")[0])
+		).length;
+		score += same * 4;
+	}
+
 	if (card.abilities.includes("bond")) {
 		const row = board.getRow(card, card.row, bot);
-		if (row.findCards(c => c.name === card.name).length > 0)
-			score += 12;
+		const same = row.findCards(c => c.name === card.name).length;
+		if (same > 0) score += 10 + same * 6;
 	}
-	if (card.abilities.includes("morale"))
-		score += 5;
+
+	if (card.abilities.includes("morale")) {
+		const row = board.getRow(card, card.row, bot);
+		score += Math.max(0, row.cards.filter(c => c.isUnit()).length * 3);
+	}
+
+	if (card.abilities.includes("berserker")) {
+		const row = board.getRow(card, "close", bot);
+		if (row.effects.mardroeme > 0) score += 14;
+	}
 
 	if (card.faction === "weather") {
 		const type = card.abilities[0];
-		const targetRows = type === "frost" ? ["close"] : type === "fog" ? ["ranged"] : type === "rain" ? ["siege"] : ["ranged", "siege"];
-		const enemyPower = targetRows.reduce((sum, r) => sum + board.getRow(card, r, player_me).total, 0);
-		score = enemyPower > 4 ? 35 + enemyPower : -10;
+		const rowNames = type === "frost" ? ["close"] :
+			type === "fog" ? ["ranged"] :
+			type === "rain" ? ["siege"] :
+			type === "storm" ? ["ranged", "siege"] : [];
+
+		let enemyPower = 0;
+		let ownPower = 0;
+		for (const r of rowNames) {
+			enemyPower += board.getRow(card, r, enemy).total;
+			ownPower += board.getRow(card, r, bot).total;
+		}
+		score = enemyPower >= 8 ? 12 + enemyPower * 1.8 - ownPower * 1.2 : -20;
 	}
 
-	if (card.name === "Clear Weather")
-		score = weather.cards.length > 0 ? 30 : -100;
+	if (card.name === "Clear Weather") {
+		const affectedOwn = botWeatherPenalty(bot);
+		const affectedEnemy = enemyWeatherPenalty(enemy);
+		score = affectedOwn - affectedEnemy > 2 ? 16 + affectedOwn * 2 : -20;
+	}
 
-	return score + Math.random() * 3;
+	if (card.name === "Scorch")
+		score = botShouldScorch(bot) ? 35 : -30;
+
+	if (card.isSpecial()) {
+		const row = botBestSpecialRow(card, bot);
+		score = row ? botSpecialValue(card, board.getRow(card, row, bot)) : -20;
+	}
+
+	// Prefer developing the side where the opponent is weakest and avoid
+	// overcommitting to a row that is already safely winning.
+	if (card.isUnit()) {
+		const rowName = botBestRow(card, bot);
+		const ownRow = board.getRow(card, rowName, bot);
+		const enemyRow = board.getRow(card, rowName, enemy);
+		if (ownRow.total < enemyRow.total)
+			score += Math.min(8, enemyRow.total - ownRow.total);
+		if (ownRow.total > enemyRow.total + 12)
+			score -= 5;
+	}
+
+	return score + Math.random() * 0.25;
 }
 
-function botBestRow(card) {
+function botBestRow(card, bot) {
 	if (card.row !== "agile")
 		return card.row;
 
-	const close = board.getRow(card, "close", player_op);
-	const ranged = board.getRow(card, "ranged", player_op);
-	return close.total >= ranged.total ? "ranged" : "close";
+	const enemy = bot.opponent();
+	const close = board.getRow(card, "close", bot);
+	const ranged = board.getRow(card, "ranged", bot);
+	const enemyClose = board.getRow(card, "close", enemy);
+	const enemyRanged = board.getRow(card, "ranged", enemy);
+
+	// Agile cards are more useful where they close the largest deficit.
+	const closeValue = (enemyClose.total - close.total) + enemyClose.total * 0.15;
+	const rangedValue = (enemyRanged.total - ranged.total) + enemyRanged.total * 0.15;
+	return closeValue >= rangedValue ? "close" : "ranged";
+}
+
+function botBestSpecialRow(card, bot) {
+	const candidates = ["close", "ranged", "siege"];
+	let best = null;
+	let bestValue = -Infinity;
+
+	for (const rowName of candidates) {
+		const row = board.getRow(card, rowName, bot);
+		if (row.special)
+			continue;
+
+		const value = botSpecialValue(card, row);
+		if (value > bestValue) {
+			bestValue = value;
+			best = rowName;
+		}
+	}
+	return bestValue > 0 ? best : null;
+}
+
+function botSpecialValue(card, row) {
+	if (card.name === "Commander's Horn")
+		return row.cards.filter(c => c.isUnit()).reduce((n, c) => n + Math.max(0, c.power), 0) * 0.9;
+	if (card.name === "Mardroeme")
+		return row.findCards(c => c.abilities.includes("berserker")).length * 12;
+	return 0;
+}
+
+function botShouldScorch(bot) {
+	const enemy = bot.opponent();
+	let enemyMax = 0;
+	let ownMax = 0;
+	let enemyCount = 0;
+	let ownCount = 0;
+
+	for (const row of board.row) {
+		for (const c of row.cards) {
+			if (!c.isUnit()) continue;
+			if (c.holder === enemy) {
+				enemyCount++;
+				enemyMax = Math.max(enemyMax, c.power);
+			} else if (c.holder === bot) {
+				ownCount++;
+				ownMax = Math.max(ownMax, c.power);
+			}
+		}
+	}
+
+	return enemyCount > 0 && enemyMax >= 10 && enemyMax > ownMax + 1;
+}
+
+function botWeatherPenalty(player) {
+	let penalty = 0;
+	for (const row of board.row) {
+		if (!row.effects.weather) continue;
+		penalty += row.cards.filter(c => c.holder === player && c.isUnit()).reduce((n, c) =>
+			n + Math.max(0, c.basePower - c.power), 0);
+	}
+	return penalty;
+}
+
+function enemyWeatherPenalty(enemy) {
+	let penalty = 0;
+	for (const row of board.row) {
+		if (!row.effects.weather) continue;
+		penalty += row.cards.filter(c => c.holder === enemy && c.isUnit()).reduce((n, c) =>
+			n + Math.max(0, c.basePower - c.power), 0);
+	}
+	return penalty;
+}
+
+function botLeaderIsSafe(bot) {
+	const name = bot.leader && bot.leader.name || "";
+	return !/Emhyr.*Relentless|Eredin.*Bringer|Eredin.*Destroyer|Emhyr.*Imperial/i.test(name);
+}
+
+function botLeaderScore(bot) {
+	const leader = bot.leader;
+	if (!leader) return 0;
+	const activated = leader.abilities && leader.abilities.length ? leader.abilities : [];
+	let score = 8;
+
+	if (activated.includes("foltest_siegemaster") || activated.includes("eredin_commander"))
+		score += board.getRow(leader, "siege", bot).total >= 8 ? 15 : 0;
+	if (activated.includes("foltest_steelforged"))
+		score += botShouldScorchRow(bot, "siege");
+	if (activated.includes("foltest_son"))
+		score += botShouldScorchRow(bot, "ranged");
+	if (activated.includes("foltest_lord"))
+		score += botWeatherPenalty(bot);
+	return score;
+}
+
+function botShouldScorchRow(bot, rowName) {
+	const enemy = bot.opponent();
+	const row = board.getRow(bot.leader, rowName, enemy);
+	return row.total >= 10 ? 12 : 0;
 }
 
 function fillCardElements (cards, player) {

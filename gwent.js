@@ -245,85 +245,99 @@ async function botPlayBestFallback(bot, cards) {
 }
 
 function botCardScore(card, bot) {
+	// Scoring must never be able to break the bot's turn. Some original
+	// cards have unusual row/target data, so optional heuristics are guarded.
 	let score = card.basePower || 0;
-	const enemy = bot.opponent();
+	try {
+		const enemy = bot.opponent();
+		const abilities = card.abilities || [];
 
-	if (card.hero)
-		score += 5;
+		if (card.hero)
+			score += 5;
 
-	if (card.abilities.includes("spy")) {
-		// Spy gives two cards: usually worth more than its printed strength.
-		score += 16 + Math.max(0, 10 - bot.hand.cards.length);
-	}
+		if (abilities.includes("spy"))
+			score += 16 + Math.max(0, 10 - bot.hand.cards.length);
 
-	if (card.abilities.includes("muster")) {
-		const same = bot.deck.cards.concat(bot.hand.cards).filter(c =>
-			c.name === card.name || c.name.startsWith(card.name.split("-")[0])
-		).length;
-		score += same * 4;
-	}
-
-	if (card.abilities.includes("bond")) {
-		const row = board.getRow(card, card.row, bot);
-		const same = row.findCards(c => c.name === card.name).length;
-		if (same > 0) score += 10 + same * 6;
-	}
-
-	if (card.abilities.includes("morale")) {
-		const row = board.getRow(card, card.row, bot);
-		score += Math.max(0, row.cards.filter(c => c.isUnit()).length * 3);
-	}
-
-	if (card.abilities.includes("berserker")) {
-		const row = board.getRow(card, "close", bot);
-		if (row.effects.mardroeme > 0) score += 14;
-	}
-
-	if (card.faction === "weather") {
-		const type = card.abilities[0];
-		const rowNames = type === "frost" ? ["close"] :
-			type === "fog" ? ["ranged"] :
-			type === "rain" ? ["siege"] :
-			type === "storm" ? ["ranged", "siege"] : [];
-
-		let enemyPower = 0;
-		let ownPower = 0;
-		for (const r of rowNames) {
-			enemyPower += board.getRow(card, r, enemy).total;
-			ownPower += board.getRow(card, r, bot).total;
+		if (abilities.includes("muster")) {
+			const same = bot.deck.cards.concat(bot.hand.cards).filter(c =>
+				c.name === card.name || c.name.startsWith(card.name.split("-")[0])
+			).length;
+			score += same * 4;
 		}
-		score = enemyPower >= 8 ? 12 + enemyPower * 1.8 - ownPower * 1.2 : -20;
+
+		// Only use row-dependent heuristics when the card has a valid native row.
+		if (abilities.includes("bond") && card.row) {
+			const row = board.getRow(card, card.row, bot);
+			if (row) {
+				const same = row.findCards(c => c.name === card.name).length;
+				if (same > 0) score += 10 + same * 6;
+			}
+		}
+
+		if (abilities.includes("morale") && card.row) {
+			const row = board.getRow(card, card.row, bot);
+			if (row) score += Math.max(0, row.cards.filter(c => c.isUnit()).length * 3);
+		}
+
+		if (abilities.includes("berserker")) {
+			const row = board.getRow(card, "close", bot);
+			if (row && row.effects.mardroeme > 0) score += 14;
+		}
+
+		if (card.faction === "weather") {
+			const type = abilities[0];
+			const rowNames = type === "frost" ? ["close"] :
+				type === "fog" ? ["ranged"] :
+				type === "rain" ? ["siege"] :
+				type === "storm" ? ["ranged", "siege"] : [];
+			let enemyPower = 0, ownPower = 0;
+			for (const r of rowNames) {
+				const er = board.getRow(card, r, enemy);
+				const or = board.getRow(card, r, bot);
+				if (er && or) {
+					enemyPower += er.total;
+					ownPower += or.total;
+				}
+			}
+			score = enemyPower >= 8 ? 12 + enemyPower * 1.8 - ownPower * 1.2 : -10;
+		}
+
+		if (card.name === "Clear Weather") {
+			const affectedOwn = botWeatherPenalty(bot);
+			const affectedEnemy = enemyWeatherPenalty(enemy);
+			score = affectedOwn - affectedEnemy > 2 ? 16 + affectedOwn * 2 : -10;
+		}
+
+		if (card.name === "Scorch")
+			score = botShouldScorch(bot) ? 35 : -10;
+
+		// Specials get a small tactical bonus, but a failure here must not
+		// make an ordinary unit unplayable.
+		if (card.isSpecial()) {
+			try {
+				const row = botBestSpecialRow(card, bot);
+				if (row) score = Math.max(score, botSpecialValue(card, board.getRow(card, row, bot)));
+			} catch (e) {}
+		}
+
+		if (card.isUnit()) {
+			try {
+				const rowName = botBestRow(card, bot);
+				const ownRow = board.getRow(card, rowName, bot);
+				const enemyRow = board.getRow(card, rowName, enemy);
+				if (ownRow && enemyRow) {
+					if (ownRow.total < enemyRow.total)
+						score += Math.min(8, enemyRow.total - ownRow.total);
+					if (ownRow.total > enemyRow.total + 12)
+						score -= 5;
+				}
+			} catch (e) {}
+		}
+	} catch (e) {
+		// Base power is still a perfectly usable fallback score.
 	}
-
-	if (card.name === "Clear Weather") {
-		const affectedOwn = botWeatherPenalty(bot);
-		const affectedEnemy = enemyWeatherPenalty(enemy);
-		score = affectedOwn - affectedEnemy > 2 ? 16 + affectedOwn * 2 : -20;
-	}
-
-	if (card.name === "Scorch")
-		score = botShouldScorch(bot) ? 35 : -30;
-
-	if (card.isSpecial()) {
-		const row = botBestSpecialRow(card, bot);
-		score = row ? botSpecialValue(card, board.getRow(card, row, bot)) : -20;
-	}
-
-	// Prefer developing the side where the opponent is weakest and avoid
-	// overcommitting to a row that is already safely winning.
-	if (card.isUnit()) {
-		const rowName = botBestRow(card, bot);
-		const ownRow = board.getRow(card, rowName, bot);
-		const enemyRow = board.getRow(card, rowName, enemy);
-		if (ownRow.total < enemyRow.total)
-			score += Math.min(8, enemyRow.total - ownRow.total);
-		if (ownRow.total > enemyRow.total + 12)
-			score -= 5;
-	}
-
 	return score + Math.random() * 0.25;
 }
-
 function botBestRow(card, bot) {
 	if (card.row !== "agile")
 		return card.row;

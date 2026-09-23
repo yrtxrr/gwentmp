@@ -1404,6 +1404,9 @@ class Game {
 		if (localBotMode) {
 			this.firstPlayer = randomInt(2) === 0 ? player_me : player_op;
 			this.currPlayer = this.firstPlayer;
+			// In bot mode the human must still get the normal Witcher 3
+			// mulligan UI. The bot performs its own redraw separately.
+			await this.initialRedraw();
 			await this.botInitialRedraw();
 			await this.startRound();
 			return;
@@ -1486,7 +1489,8 @@ class Game {
 			await ui.queueCarousel(player_me.hand, 2, async (c, i) => await player_me.deck.swap(c, c.removeCard(i)), c => true, true, true, "Choose up to 2 cards to redraw.");
 		ui.enablePlayer(false);
 
-		socket.send(JSON.stringify({ type: "initial_reDraw", hand: removeCircularReferences(player_me.hand.cards), deck: removeCircularReferences(player_me.deck.cards) }));
+		if (!localBotMode)
+			socket.send(JSON.stringify({ type: "initial_reDraw", hand: removeCircularReferences(player_me.hand.cards), deck: removeCircularReferences(player_me.deck.cards) }));
 	}
 	
 	// Initiates a new round of the game

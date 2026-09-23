@@ -154,55 +154,39 @@ async function botTakeTurn(bot) {
 	if (!localBotMode || bot !== player_op || bot.passed)
 		return;
 
-	// The bot evaluates the board before every move instead of simply
-	// throwing its highest-power card onto its native row.
-	const hand = bot.hand.cards.slice();
-	const playable = hand.filter(card => {
-		if (card.name === "Decoy" || card.abilities.includes("medic"))
-			return false;
-		return true;
-	});
-
-	if (playable.length === 0) {
-		bot.passRound();
-		return;
-	}
-
-	// Passing is an important part of classic Gwent. Don't spend cards
-	// unnecessarily when we're already comfortably ahead.
-	const lead = bot.total - player_me.total;
-	if (lead >= 7 && hand.length <= player_me.hand.cards.length + 1) {
-		bot.passRound();
-		return;
-	}
-
-	// Use a leader ability when it has a clear, safe payoff. Some original
-	// leaders require a human selection UI, so those are intentionally left
-	// for later rather than risking a stuck bot turn.
-	if (bot.leaderAvailable && botLeaderIsSafe(bot)) {
-		const leaderValue = botLeaderScore(bot);
-		if (leaderValue >= 18 || (lead < -10 && leaderValue >= 10)) {
-			try {
-				await bot.activateLeader();
-				return;
-			} catch (err) {
-				console.error("Bot leader failed:", err);
-			}
-		}
-	}
-
-	const scored = playable.map(card => ({
-		card,
-		score: botCardScore(card, bot)
-	})).sort((a, b) => b.score - a.score);
-
-	const best = scored[0];
-	if (!best || best.score < -25) {
-		bot.passRound();
-		return;
-	}
-
 	try {
+		const hand = bot.hand.cards.slice();
+		const playable = hand.filter(card => {
+			if (card.name === "Decoy" || card.abilities.includes("medic"))
+				return false;
+			return true;
+		});
+
+		if (playable.length === 0) {
+			bot.passRound();
+			return;
+		}
+
+		// Do not auto-use leader abilities yet. Several original leader
+		// abilities require a human target/selection and can otherwise leave
+		// the local bot waiting forever.
+		const lead = bot.total - player_me.total;
+		if (lead >= 7 && hand.length <= player_me.hand.cards.length + 1) {
+			bot.passRound();
+			return;
+		}
+
+		const scored = playable.map(card => ({
+			card,
+			score: botCardScore(card, bot)
+		})).sort((a, b) => b.score - a.score);
+
+		const best = scored[0];
+		if (!best || best.score < -25) {
+			bot.passRound();
+			return;
+		}
+
 		const card = best.card;
 
 		if (card.name === "Scorch") {
@@ -213,12 +197,7 @@ async function botTakeTurn(bot) {
 			return;
 		}
 
-		if (card.name === "Clear Weather") {
-			await bot.playCard(card);
-			return;
-		}
-
-		if (card.faction === "weather") {
+		if (card.name === "Clear Weather" || card.faction === "weather") {
 			await bot.playCard(card);
 			return;
 		}
@@ -239,12 +218,17 @@ async function botTakeTurn(bot) {
 
 		await botPlayBestFallback(bot, playable);
 	} catch (err) {
+		// A bot error must never leave the match stuck on the bot's turn.
 		console.error("Bot turn failed:", err);
-		if (!bot.passed)
-			bot.passRound();
+		if (!bot.passed) {
+			try {
+				bot.passRound();
+			} catch (passErr) {
+				console.error("Bot fallback pass failed:", passErr);
+			}
+		}
 	}
 }
-
 async function botPlayBestFallback(bot, cards) {
 	const units = cards.filter(c => c.isUnit()).sort((a, b) => botCardScore(b, bot) - botCardScore(a, bot));
 	if (units.length) {
@@ -553,6 +537,7 @@ class Player {
 			document.getElementById("pass-button").classList.remove("noclick");
 		} else if (localBotMode && this === player_op) {
 			await sleep(650);
+			// Never let an exception in the bot logic stop the game loop.
 			await botTakeTurn(this);
 		}
 	}

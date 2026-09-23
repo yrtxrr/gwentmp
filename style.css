@@ -2057,6 +2057,21 @@ html {
 }
 
 
+#bot-game {
+	position: absolute;
+	z-index: 87;
+	top: 95%;
+	left: 38.95%;
+	width: 7%;
+	height: 3%;
+	font-size: 0.98vw;
+	white-space: nowrap;
+	color: rgb(238, 238, 238);
+	background-color: rgb(20,20,20);
+	box-shadow: 0px 3px 5px 0px rgba(0, 0, 0, 0.4);
+	border: 0.1vw ridge rgb(30,30,30);
+}
+
 #create-game {
 	position: relative;
 	z-index: 87;

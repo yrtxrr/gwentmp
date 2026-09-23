@@ -2,9 +2,17 @@
 
 class Controller {}
 
+class ControllerBot {
+	constructor(player) {
+		player.tag = "op";
+		this.player = player;
+	}
+}
+
 // Websocket and Server config.
 // const socket = new WebSocket('ws://127.0.0.1:8080');				// Example line for when using local installation instead of remote deployment.
 const socket = new WebSocket('wss://gwent-render.onrender.com');	// Websocket + server is expected to be reachable on this URL. Disable if using local installation.
+let localBotMode = false;
 let amReady = false;
 let opponentReady = false;
 let playerId = null;
@@ -141,6 +149,102 @@ socket.onmessage = async(event) => {
 		}
 };
 
+
+async function botTakeTurn(bot) {
+	if (!localBotMode || bot !== player_op || bot.passed)
+		return;
+
+	const hand = bot.hand.cards.slice();
+	const playable = hand.filter(card => {
+		if (card.name === "Decoy" || card.abilities.includes("medic"))
+			return false;
+		if (card.name === "Clear Weather" && weather.cards.length === 0)
+			return false;
+		return true;
+	});
+
+	if (playable.length === 0) {
+		bot.passRound();
+		return;
+	}
+
+	const scored = playable.map(card => ({ card, score: botCardScore(card, bot) }));
+	scored.sort((a, b) => b.score - a.score);
+	const card = scored[0].card;
+
+	try {
+		if (card.name === "Scorch") {
+			await bot.playScorch(card);
+			return;
+		}
+
+		if (card.faction === "weather") {
+			await bot.playCard(card);
+			return;
+		}
+
+		if (card.isUnit()) {
+			const rowName = botBestRow(card);
+			await bot.playCardToRow(card, board.getRow(card, rowName, bot));
+			return;
+		}
+
+		// Special cards that require a human target are deliberately held for now.
+		const fallback = playable.find(c => c.isUnit() || c.faction === "weather" || c.name === "Scorch");
+		if (fallback) {
+			if (fallback.name === "Scorch")
+				await bot.playScorch(fallback);
+			else if (fallback.faction === "weather")
+				await bot.playCard(fallback);
+			else
+				await bot.playCardToRow(fallback, board.getRow(fallback, botBestRow(fallback), bot));
+		} else {
+			bot.passRound();
+		}
+	} catch (err) {
+		console.error("Bot turn failed:", err);
+		if (!bot.passed)
+			bot.passRound();
+	}
+}
+
+function botCardScore(card, bot) {
+	let score = card.basePower || 0;
+
+	if (card.abilities.includes("spy"))
+		score += 18;
+	if (card.abilities.includes("muster"))
+		score += 8;
+	if (card.abilities.includes("bond")) {
+		const row = board.getRow(card, card.row, bot);
+		if (row.findCards(c => c.name === card.name).length > 0)
+			score += 12;
+	}
+	if (card.abilities.includes("morale"))
+		score += 5;
+
+	if (card.faction === "weather") {
+		const type = card.abilities[0];
+		const targetRows = type === "frost" ? ["close"] : type === "fog" ? ["ranged"] : type === "rain" ? ["siege"] : ["ranged", "siege"];
+		const enemyPower = targetRows.reduce((sum, r) => sum + board.getRow(card, r, player_me).total, 0);
+		score = enemyPower > 4 ? 35 + enemyPower : -10;
+	}
+
+	if (card.name === "Clear Weather")
+		score = weather.cards.length > 0 ? 30 : -100;
+
+	return score + Math.random() * 3;
+}
+
+function botBestRow(card) {
+	if (card.row !== "agile")
+		return card.row;
+
+	const close = board.getRow(card, "close", player_op);
+	const ranged = board.getRow(card, "ranged", player_op);
+	return close.total >= ranged.total ? "ranged" : "close";
+}
+
 function fillCardElements (cards, player) {
 	for (let i = 0; i < cards.length; i++) {
 		const cardFromDict = card_dict.find(dict => dict.filename === cards[i].filename);
@@ -163,7 +267,7 @@ class Player {
 	constructor(id, name, deck) {
 		this.id = id;
 		this.tag = "me";
-		this.controller = (id === 0) ? new Controller() : new ControllerOpponent(this);
+		this.controller = (id === 0) ? new Controller() : (localBotMode ? new ControllerBot(this) : new ControllerOpponent(this));
 
 		this.hand = (id === 0) ? new Hand(document.getElementById("hand-row")) : new HandOpponent();
 		this.grave =  new Grave( document.getElementById("grave-" + this.tag));
@@ -238,6 +342,9 @@ class Player {
 		
 		if (this === player_me) {
 			document.getElementById("pass-button").classList.remove("noclick");
+		} else if (localBotMode && this === player_op) {
+			await sleep(650);
+			await botTakeTurn(this);
 		}
 	}
 	
@@ -1084,6 +1191,14 @@ class Game {
 		
 		await this.runEffects(this.gameStart);
 		tocar("game_opening", false);
+
+		if (localBotMode) {
+			this.firstPlayer = randomInt(2) === 0 ? player_me : player_op;
+			this.currPlayer = this.firstPlayer;
+			await this.botInitialRedraw();
+			await this.startRound();
+			return;
+		}
 		if (player_op.deck.faction === "scoiatael" && player_me.deck.faction !== "scoiatael") {
 			await new Promise((resolve) => {
 				const handleMessage = async (event) => {
@@ -1143,6 +1258,18 @@ class Game {
 	}
 	
 	// Allows the player to swap out up to two cards from their iniitial hand
+	async botInitialRedraw(){
+		for (let i = 0; i < 2; i++) {
+			if (player_op.hand.cards.length === 0 || player_op.deck.cards.length === 0)
+				break;
+			const candidates = player_op.hand.cards.filter(c => !c.abilities.includes("medic"));
+			if (candidates.length === 0)
+				break;
+			const card = candidates[randomInt(candidates.length)];
+			player_op.deck.swap(player_op.hand, card);
+		}
+	}
+
 	async initialRedraw(){
 		if (debug == true)
 			await ui.queueCarousel(player_me.hand, 99, async (c, i) => await player_me.deck.swap(c, c.removeCard(i)), c => true, true, true, "Choose up to 99 cards to redraw.");
@@ -1283,7 +1410,8 @@ class Game {
 	
 	// Returns the client to the deck customization screen
 	returnToCustomization(){
-		socket.send(JSON.stringify({ type: "unReady" }));
+		if (!localBotMode)
+			socket.send(JSON.stringify({ type: "unReady" }));
 		amReady = false;
 		opponentReady = false;
 		readyButtonElem.classList.remove("ready");
@@ -1305,7 +1433,11 @@ class Game {
 		player_me.reset();
 		player_op.reset();
 		this.endScreen.classList.add("hide");
-		this.startGame();
+		if (localBotMode) {
+			this.startGame();
+		} else {
+			this.startGame();
+		}
 	}
 	
 	// Executes effects in list. If effect returns true, effect is removed.
@@ -2099,6 +2231,7 @@ class DeckMaker {
 		document.getElementById("download-deck").addEventListener("click", () => this.downloadDeck(), false);
 		document.getElementById("add-file").addEventListener("change", () => this.uploadDeck(), false);
 		readyButtonElem.addEventListener("click", () => this.startNewGame(), false);
+		document.getElementById("bot-game").addEventListener("click", () => this.startBotGame(), false);
 		somCarta();
 		
 		this.update();
@@ -2349,6 +2482,48 @@ class DeckMaker {
 			this.elem.classList.add("hide");
 			game.startGame();
 		}
+	}
+
+	// Starts a local single-player match without using the WebSocket server.
+	async startBotGame(){
+		let warning = "";
+		if (this.stats.units < 22)
+			warning += "Your deck must have at least 22 unit cards. \n";
+		if (this.stats.special > 10)
+			warning += "Your deck must have no more than 10 special cards. \n";
+		if (warning)
+			return alert(warning);
+
+		localBotMode = true;
+		amReady = false;
+		opponentReady = false;
+
+		const me_deck = {
+			faction: this.faction,
+			leader: card_dict[this.leader.index],
+			cards: this.deck.filter(x => x.count > 0)
+		};
+
+		const candidates = premade_deck.filter(d => d.faction !== me_deck.faction);
+		const source = candidates[randomInt(candidates.length)];
+		const bot_deck = {
+			faction: source.faction,
+			leader: card_dict[source.leader],
+			cards: source.cards.map(c => ({index: c[0], count: c[1]}))
+		};
+
+		player_me = new Player(0, "you", me_deck);
+		player_op = new Player(1, "Bot", bot_deck);
+
+		document.getElementById("create-game").classList.add("hidden");
+		document.getElementById("join-game").classList.add("hidden");
+		document.getElementById("bot-game").classList.add("hidden");
+		gameStartControlsElem.classList.add("hide");
+		opponentReadyElem.classList.add("hidden");
+		this.elem.classList.add("hide");
+
+		game.reset();
+		await game.startGame();
 	}
 	
 	// Converts the current deck to a JSON string

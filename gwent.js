@@ -1386,6 +1386,7 @@ class Game {
 	// Initializes player abilities, hands and waits for cointoss
 	async startGame() {
 		gameStartControlsElem.classList.add("hide");
+		document.getElementById("bot-game").classList.add("hide");
 		isOpponentReadyElem.classList.add("hidden");
 		ui.toggleMusic_elem.style.left = "26vw"
 
@@ -2526,6 +2527,7 @@ class DeckMaker {
 		
 		let bankID = {index: index, count: num, elem: elem};
 		let isBank = cards === this.bank;
+		count.classList.add("card-count");
 		count.innerHTML = bankID.count;
 		cards.push(bankID);
 		let cardIndex = cards.length-1;
@@ -2729,7 +2731,7 @@ class DeckMaker {
 
 		document.getElementById("create-game").classList.add("hidden");
 		document.getElementById("join-game").classList.add("hidden");
-		document.getElementById("bot-game").classList.add("hidden");
+		document.getElementById("bot-game").classList.add("hide");
 		gameStartControlsElem.classList.add("hide");
 		opponentReadyElem.classList.add("hidden");
 		this.elem.classList.add("hide");
